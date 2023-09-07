@@ -1,0 +1,616 @@
+PROCEDURE close_relation_ccs_p( p_process_name    IN tkt_bac_process_all.process_name%TYPE   DEFAULT 'CLOSE_RELATION_CCS'
+                                , p_process_source  IN tkt_bac_process_all.process_source%TYPE DEFAULT 'BACEN'
+                                , p_company         IN tkt_bac_process_all.company%TYPE        DEFAULT NULL
+                                )  IS
+    --
+    l_rTBPA  tkt_bac_process_all%ROWTYPE;
+    l_rTBMH  tkt_bac_msg_hdrs_all%ROWTYPE;
+    l_rTBML  tkt_bac_msg_lines_all%ROWTYPE;
+    l_rTBRCA tkt_bac_relation_ccs_all%ROWTYPE;
+    --
+    CURSOR c_company IS
+      SELECT tbca.company
+        FROM tkt_bac_company_all      tbca
+           , tkt_bac_erp_versions_all tbeva
+       WHERE tbca.company     = NVL( l_rTBPA.company, tbca.company )
+         AND tbca.erp_version = tbeva.erp_version
+         AND TRUNC(SYSDATE)   BETWEEN TRUNC(tbca.start_date)  AND TRUNC(NVL(tbca.end_date,SYSDATE))
+         AND TRUNC(SYSDATE)   BETWEEN TRUNC(tbeva.start_date) AND TRUNC(NVL(tbeva.end_date,SYSDATE))
+       ORDER BY tbca.company DESC; -- P/ deixar a 00050 (TKT) por último.
+    --
+    CURSOR c_relation ( pc_company IN tkt_bac_company_all.company%TYPE ) IS
+      SELECT tbrca.relation_ccs_id
+           , tbrca.titular_number
+           , tbrca.titular_type
+           , tbrca.company
+           , tbrca.relation_type
+           , tbrca.conta_pgto_id
+        FROM tkt_bac_relation_ccs_all tbrca
+       WHERE tbrca.company       = pc_company
+         AND tbrca.ccs_view_type = 'BDV'
+         AND tbrca.end_date      IS NULL;
+    l_rRelation c_relation%ROWTYPE;
+    --
+    CURSOR c_accounts_holder( pc_conta_pgto_id tkt_bac_conta_pgtos_all.conta_pgto_id%TYPE ) IS
+      SELECT tbcp.*
+        FROM tkt_bac_conta_pgtos_all tbcp
+       WHERE tbcp.conta_pgto_id    = pc_conta_pgto_id
+         AND tbcp.conta_pgto_tipo  = 'PRE'
+         AND tbcp.pat              = 'N';
+    l_rAccounts_Holder c_accounts_holder%ROWTYPE;
+    --
+    CURSOR c_accounts_customer( pc_conta_pgto_id tkt_bac_conta_pgtos_all.conta_pgto_id%TYPE ) IS
+      SELECT tbcp.*
+        FROM tkt_bac_conta_pgtos_all tbcp
+       WHERE tbcp.conta_pgto_id   = pc_conta_pgto_id
+         AND tbcp.conta_pgto_tipo = 'PRE'
+         AND tbcp.pat             = 'N';
+    l_rAccounts_Customer c_accounts_customer%ROWTYPE;
+    --
+    CURSOR c_balance( pc_titular_id    tkt_bac_balances_all.titular_id%TYPE
+                    , pc_conta_pgto_id tkt_bac_balances_all.conta_pgto_id%TYPE
+                    ) IS
+      WITH tab_max_balances AS
+      ( SELECT MAX( tbba_max.process_id ) process_id
+          FROM tkt_bac_balances_all tbba_max
+         WHERE tbba_max.titular_id      = pc_titular_id
+           AND tbba_max.conta_pgto_id   = pc_conta_pgto_id
+      )
+      SELECT tbba.balance_amount
+        FROM tkt_bac_balances_all tbba
+           , tab_max_balances
+       WHERE tbba.process_id      = tab_max_balances.process_id
+         AND tbba.titular_id      = pc_titular_id
+         AND tbba.conta_pgto_id   = pc_conta_pgto_id;
+    --
+    CURSOR c_balance_customer( pc_conta_pgto_id tkt_bac_balances_all.conta_pgto_id%TYPE
+                             ) IS
+      WITH tab_max_balances AS
+      ( SELECT MAX( tbba_max.process_id ) process_id
+          FROM tkt_bac_balances_all tbba_max
+         WHERE tbba_max.conta_pgto_id   = pc_conta_pgto_id
+      )
+      SELECT tbba.balance_amount
+        FROM tkt_bac_balances_all tbba
+           , tab_max_balances
+       WHERE tbba.process_id     = tab_max_balances.process_id
+         AND tbba.conta_pgto_id  = pc_conta_pgto_id;
+    --
+    CURSOR c_purge_balance( pc_titular_id tkt_bac_purge_balances_all.titular_id%TYPE
+                          , pc_conta_pgto_id tkt_bac_balances_all.conta_pgto_id%TYPE
+                          ) IS
+      SELECT tbpb.operation_amount
+        FROM tkt_bac_purge_balances_all tbpb
+       WHERE tbpb.titular_id      = pc_titular_id
+         AND tbpb.conta_pgto_id   = pc_conta_pgto_id;
+    --
+    CURSOR c_purge_balance_customer( pc_conta_pgto_id tkt_bac_balances_all.conta_pgto_id%TYPE
+                                   ) IS
+      SELECT tbpb.operation_amount
+        FROM tkt_bac_purge_balances_all tbpb
+       WHERE tbpb.conta_pgto_id   = pc_conta_pgto_id;
+    --
+    CURSOR c_contracts( pc_contract_number tkt_bac_contracts_all.contract_number%TYPE
+                      , pc_company         tkt_bac_contracts_all.company%TYPE
+                      ) IS
+      WITH tab_tbca_max AS
+      ( SELECT max( tbca.process_id ) process_id
+          FROM tkt_bac_contracts_all tbca
+         WHERE tbca.contract_number = pc_contract_number
+           AND tbca.company         = pc_company
+      )
+      SELECT tbca.sts_code
+        FROM tkt_bac_contracts_all tbca
+           , tab_tbca_max
+       WHERE tbca.contract_number = pc_contract_number
+         AND tbca.company         = pc_company
+         AND tbca.process_id      = tab_tbca_max.process_id;
+    l_rContracts c_contracts%ROWTYPE;
+    --
+    CURSOR c_customer( pc_customer_number tkt_bac_customers_all.customer_number%TYPE
+                     --, pc_company         tkt_bac_customers_all.company%TYPE
+                     ) IS
+      SELECT cust_account_id
+        FROM tkt_bac_customers_all tbca
+       WHERE tbca.customer_number = pc_customer_number;
+    --
+    CURSOR c_exists_trx_for_period( pc_company tkt_bac_ar_open_inv_all.company%TYPE
+                                  , pc_period  tkt_bac_ar_open_inv_all.closing_month%TYPE
+                                  ) IS
+      SELECT 1
+        FROM tkt_bac_ar_open_inv_all tbaoi
+       WHERE tbaoi.company       = pc_company
+         AND tbaoi.closing_month = pc_period;
+    --
+    CURSOR c_exists_trx_for_customer( pc_customer_id tkt_bac_ar_open_inv_all.customer_id%TYPE
+                                    , pc_company     tkt_bac_ar_open_inv_all.company%TYPE
+                                    , pc_period_ini  tkt_bac_ar_open_inv_all.closing_month%TYPE
+                                    , pc_period_fim  tkt_bac_ar_open_inv_all.closing_month%TYPE
+                                    ) IS
+      SELECT 1
+        FROM tkt_bac_ar_open_inv_all tbaoi
+       WHERE tbaoi.company       = pc_company
+         AND tbaoi.customer_id   = pc_customer_id
+         AND tbaoi.closing_month BETWEEN pc_period_ini AND pc_period_fim;
+    l_nAux NUMBER;
+    --
+    CURSOR c_exists_event_for_period( pc_company tkt_bac_ar_event_inv_all.company%TYPE
+                                    , pc_period  tkt_bac_ar_event_inv_all.closing_period%TYPE
+                                    ) IS
+      SELECT 1
+        FROM tkt_bac_ar_event_inv_all tbaeia
+       WHERE tbaeia.company        = pc_company
+         AND tbaeia.closing_period = pc_period;
+    --
+    CURSOR c_exists_event_for_customer( pc_customer_id tkt_bac_ar_event_inv_all.cust_account_id%TYPE
+                                      , pc_company     tkt_bac_ar_event_inv_all.company%TYPE
+                                      , pc_period_ini  tkt_bac_ar_event_inv_all.closing_period%TYPE
+                                      , pc_period_fim  tkt_bac_ar_event_inv_all.closing_period%TYPE
+                                      ) IS
+      SELECT 1
+        FROM tkt_bac_ar_event_inv_all tbaei
+       WHERE tbaei.company         = pc_company
+         AND tbaei.cust_account_id = pc_customer_id
+         AND tbaei.closing_period  BETWEEN pc_period_ini AND pc_period_fim;
+    --
+    CURSOR c_TitularCLIENTE_CCS_Open( pc_titular_number tkt_bac_relation_ccs_all.titular_number%TYPE
+                                    , pc_titular_type   tkt_bac_relation_ccs_all.titular_type%TYPE
+                                    , pc_company        tkt_bac_relation_ccs_all.company%TYPE
+                                    ) IS
+      SELECT tbrca.relation_ccs_id
+        FROM tkt_bac_relation_ccs_all tbrca
+       WHERE tbrca.titular_number = pc_titular_number
+         AND tbrca.titular_type   = pc_titular_type
+         AND tbrca.company        = pc_company
+         AND tbrca.relation_type  = 'CLIENTE'
+         AND tbrca.ccs_view_type  = 'BDV'
+         AND tbrca.end_date       IS NULL;
+    --
+    CURSOR c_RepCCS_Open( pc_titular_number tkt_bac_relation_ccs_all.titular_number%TYPE
+                        , pc_titular_type   tkt_bac_relation_ccs_all.titular_type%TYPE
+                        , pc_company        tkt_bac_relation_ccs_all.company%TYPE
+                        ) IS
+      SELECT tbrca.relation_ccs_id
+           , tbrca.titular_number
+           , tbrca.titular_type
+        FROM tkt_bac_relation_ccs_all tbrca
+       WHERE tbrca.titular_number_bdv = pc_titular_number
+         AND tbrca.titular_type_bdv   = pc_titular_type
+         AND tbrca.company            = pc_company
+         AND tbrca.relation_type      = 'REPRESENTANTE'
+         AND tbrca.ccs_view_type      = 'REP'
+         AND tbrca.end_date           IS NULL;
+    --
+    l_nBalance           NUMBER;
+    l_nContract_Group_Id tkt_bac_classif_all.contract_group_id%TYPE;
+    l_bUpd_End_Date      BOOLEAN;
+    l_bEvent_for_period  BOOLEAN;
+    l_bTrx_for_period    BOOLEAN;
+    l_vCCS               tkt_bac_classif_all.indicator_value%TYPE;
+    l_vData_Rel_Fim      tkt_bac_classif_all.indicator_value%TYPE;
+    l_bNextStep          BOOLEAN := TRUE;
+    l_vPeriod_ini        tkt_bac_ar_event_inv_all.closing_period%TYPE;
+    l_vPeriod_fim        tkt_bac_ar_event_inv_all.closing_period%TYPE;
+    l_nCust_account_id   tkt_bac_customers_all.cust_account_id%TYPE;
+    --
+  BEGIN
+    --
+    dbms_output.put_line( 'INICIO    : ' || TO_CHAR( SYSDATE, 'dd/mm/yyyy hh24:mi:ss' ) );
+    dbms_output.put_line( 'p_process_name   -> ' || p_process_name );
+    dbms_output.put_line( 'p_process_source -> ' || p_process_source );
+    dbms_output.put_line( 'p_company        -> ' || p_company );
+    --
+    TKT_FND_BAC_UTIL_PKG.initialize_p
+      ( p_process_name    => p_process_name
+      , p_process_source  => p_process_source
+      , p_company         => p_company
+      , p_rTBPA           => l_rTBPA
+      , p_rTBMH           => l_rTBMH
+      , p_rTBML           => l_rTBML
+      );
+    --
+    dbms_output.put_line( 'process_id       -> ' || TO_CHAR(l_rTBPA.process_id));
+    dbms_output.put_line( 'period           -> ' || TO_CHAR(l_rTBPA.period, 'DD/MM/YYYY') );
+    --
+    l_rTBPA.source_qtd_read     := NVL(l_rTBPA.source_qtd_read, 0);
+    l_rTBPA.source_qtd_rejected := NVL(l_rTBPA.source_qtd_rejected, 0);
+    l_rTBPA.source_qtd_recorded := NVL(l_rTBPA.source_qtd_recorded, 0);
+    g_nRet_Validate_Code        := 0;
+    --
+    TKT_FND_BAC_UTIL_PKG.validate_all_p( p_rTBPA       => l_rTBPA
+                                       , p_rTBML       => l_rTBML
+                                       , p_return_code => g_nRet_Validate_Code
+                                       );
+    --
+    IF g_nRet_Validate_Code = 0 THEN
+      l_bNextStep := TRUE;
+    ELSE
+      l_bNextStep := FALSE;
+    END IF;
+    --
+    IF l_bNextStep THEN -- 20
+      --
+      TKT_WAT_BAC_UTIL_PKG.set_bacen_classif_p;
+      g_bError := FALSE;
+      --
+      -- Antes de comecar o processamento, p/ evitar de fazer esta(s) consulta(s) p/ todas as linhas:
+      --
+      l_vPeriod_fim       := TO_CHAR( ADD_MONTHS(SYSDATE,-1), 'YYYYMM' ); -- voltar 1 mes
+      l_vPeriod_ini       := TO_CHAR( ADD_MONTHS(SYSDATE,-7), 'YYYYMM' ); -- voltar 6 meses a partir do periodo_ini
+
+      FOR l_rCompany IN c_company LOOP
+        --
+        l_rTBML.message_code := 'T00001';
+        l_rTBML.message      := l_rTBML.message_code || ' - '
+                             || TKT_FND_BAC_UTIL_PKG.get_message_f( p_message_code => l_rTBML.message_code )
+                             || ' - EMPRESA: ' || l_rCompany.company;
+        --
+        TKT_FND_BAC_UTIL_PKG.set_msg_l_p( p_rTBML => l_rTBML );
+        --
+        -- 1) Verificar se tem fatura nos últimos 6 meses...
+        l_bTrx_for_period := TRUE;
+        OPEN c_exists_trx_for_period( pc_company => l_rCompany.company
+                                    , pc_period  => l_vPeriod_ini
+                                    );
+        FETCH c_exists_trx_for_period INTO l_nAux;
+        IF c_exists_trx_for_period%NOTFOUND THEN
+          --
+          l_bTrx_for_period := FALSE;
+          --
+        END IF;
+        CLOSE c_exists_trx_for_period;
+        --
+        -- 2) Verificar se tem evento financeiro nos últimos 6 meses...
+        l_bEvent_for_period := TRUE;
+        OPEN c_exists_event_for_period( pc_company => l_rCompany.company
+                                      , pc_period  => l_vPeriod_ini
+                                      );
+        FETCH c_exists_event_for_period INTO l_nAux;
+        IF c_exists_event_for_period%NOTFOUND THEN
+          --
+          l_bEvent_for_period := FALSE;
+          --
+        END IF;
+        CLOSE c_exists_event_for_period;
+        --
+        --
+        -- Inicio do processamento...
+        OPEN c_relation( l_rCompany.company );
+        LOOP
+          l_rRelation := NULL;
+          FETCH c_relation INTO l_rRelation;
+          EXIT WHEN c_relation%NOTFOUND;
+          --
+          --l_bUpd_End_Date          := FALSE;
+          l_rTBRCA.relation_ccs_id := l_rRelation.relation_ccs_id;
+          l_rTBPA.source_qtd_read  := l_rTBPA.source_qtd_read + 1;
+          --
+          -- ******** --
+          -- PORTADOR --
+          -- ******** --
+          IF l_rRelation.relation_type = 'PORTADOR' THEN
+            --
+            OPEN c_accounts_holder( pc_conta_pgto_id => l_rRelation.conta_pgto_id );
+            LOOP
+              l_rAccounts_Holder := NULL;
+              FETCH c_accounts_holder INTO l_rAccounts_Holder;
+              EXIT WHEN c_accounts_holder%NOTFOUND;
+              --
+              l_bUpd_End_Date      := TRUE;
+              l_nContract_Group_Id := l_rAccounts_Holder.contract_group_id;
+              --
+              l_vCCS := TKT_WAT_BAC_UTIL_PKG.get_bacen_classif_f( p_contract_group_id => l_nContract_Group_Id
+                                                                , p_indicator_name    => 'CCS'
+                                                                );
+              --
+              IF l_vCCS = 'Y' THEN
+                l_vData_Rel_Fim := TKT_WAT_BAC_UTIL_PKG.get_bacen_classif_f( p_contract_group_id => l_nContract_Group_Id
+                                                                           , p_indicator_name    => 'DATA_REL_FIM'
+                                                                           );
+                --
+                -- Opcao 1 - Conta de Cartao Cancelada + Saldo 0 nos Cartoes
+                IF l_vData_Rel_Fim = 1 THEN
+                  --
+                  -- Verificar se Status da Conta esta Aiva
+                  IF l_rAccounts_Holder.account_status = 'ACTIVE' THEN
+                    l_bUpd_End_Date := FALSE;
+                  END IF;
+                  --
+                  IF l_bUpd_End_Date THEN -- 10
+                    --
+                    OPEN c_balance( pc_titular_id    => l_rAccounts_Holder.titular_id
+                                  , pc_conta_pgto_id => l_rRelation.conta_pgto_id
+                                  );
+                    FETCH c_balance INTO l_nBalance;
+                    IF c_balance%FOUND AND nvl( l_nBalance, 0 ) != 0 THEN
+                      l_bUpd_End_Date := FALSE;
+                    END IF;
+                    CLOSE c_balance;
+                    --
+                  END IF; -- IF l_bUpd_End_Date THEN -- 10
+                  --
+                  IF l_bUpd_End_Date THEN -- 20
+                    OPEN c_purge_balance( pc_titular_id    => l_rAccounts_Holder.titular_id
+                                        , pc_conta_pgto_id => l_rRelation.conta_pgto_id
+                                        );
+                    FETCH c_purge_balance INTO l_nBalance;
+                    IF c_purge_balance%FOUND AND nvl( l_nBalance, 0 ) != 0 THEN
+                      l_bUpd_End_Date := FALSE;
+                    END IF;
+                    CLOSE c_purge_balance;
+                  END IF; -- IF l_bUpd_End_Date THEN -- 20
+                  --
+                END IF; -- IF l_vData_Rel_Fim
+                --
+                IF l_bUpd_End_Date THEN
+                  Finalize_Relation_CCS_p( p_rTBRCA => l_rTBRCA
+                                         , p_rTBML  => l_rTBML
+                                         );
+                  l_rTBPA.source_qtd_recorded := l_rTBPA.source_qtd_recorded + 1;
+                END IF;
+                --
+              END IF; -- IF l_vCCS = 'Y' THEN
+              --
+              --
+            END LOOP;
+            CLOSE c_accounts_holder;
+            --
+          --
+          -- ******* --
+          -- CLIENTE --
+          -- ******* --
+          ELSIF l_rRelation.relation_type = 'CLIENTE' THEN
+            l_bUpd_End_Date := TRUE;
+            IF NOT l_bTrx_for_period OR NOT l_bEvent_for_period THEN
+              --
+              -- Se nao tem fatura .OU. nao tem evento financeiro para o periodo_fim, ja sinalizar que nao vai encerrar o relacionamento.
+              l_bUpd_End_Date := FALSE;
+            END IF;
+            --
+            IF l_bUpd_End_Date THEN
+              OPEN c_accounts_customer( pc_conta_pgto_id   => l_rRelation.conta_pgto_id );
+              LOOP
+                l_rAccounts_Customer := NULL;
+                FETCH c_accounts_customer INTO l_rAccounts_Customer;
+                EXIT WHEN c_accounts_customer%NOTFOUND;
+                --
+                l_bUpd_End_Date      := TRUE;
+                l_nContract_Group_Id := l_rAccounts_Customer.contract_group_id;
+                --
+                l_vCCS          := TKT_WAT_BAC_UTIL_PKG.get_bacen_classif_f( p_contract_group_id => l_nContract_Group_Id
+                                                                           , p_indicator_name    => 'CCS'
+                                                                           );
+                --
+                IF l_vCCS = 'Y' THEN
+                  l_vData_Rel_Fim := TKT_WAT_BAC_UTIL_PKG.get_bacen_classif_f( p_contract_group_id => l_nContract_Group_Id
+                                                                             , p_indicator_name    => 'DATA_REL_FIM'
+                                                                             );
+                  --
+                  -- Opcao 3 - Contrato Desativado + Sem Faturamento nos Últimos 6 meses + Saldo 0 nos Cartoes
+                  IF l_vData_Rel_Fim = 3 THEN
+                    --
+                    -- 1) Verificar se tem Contrato Ativo
+                    OPEN c_contracts( pc_contract_number => l_rAccounts_Customer.okc_contract_number
+                                    , pc_company         => l_rRelation.company
+                                    );
+                    FETCH c_contracts INTO l_rContracts;
+                    IF c_contracts%FOUND THEN
+                      IF l_rContracts.sts_code IN( 'ACTIVE', 'QA_HOLD' ) THEN
+                        --
+                        l_bUpd_End_Date := FALSE;
+                        --
+                      END IF;
+                    ELSE
+                      --
+                      l_bUpd_End_Date := FALSE;
+                      --
+                    END IF;
+                    CLOSE c_contracts;
+                    --
+                    -- 2) Verificar Saldo da Conta
+                    IF l_bUpd_End_Date THEN
+                      OPEN c_balance_customer( pc_conta_pgto_id => l_rRelation.conta_pgto_id );
+                      FETCH c_balance_customer INTO l_nBalance;
+                      IF c_balance_customer%FOUND AND nvl( l_nBalance, 0 ) != 0 THEN
+                        l_bUpd_End_Date := FALSE;
+                      END IF;
+                      CLOSE c_balance_customer;
+                    END IF;
+                    --
+                    -- 3) Verificar Saldo Expurgado
+                    IF l_bUpd_End_Date THEN
+                      OPEN c_purge_balance_customer( pc_conta_pgto_id => l_rRelation.conta_pgto_id );
+                      FETCH c_purge_balance_customer INTO l_nBalance;
+                      IF c_purge_balance_customer%FOUND AND nvl( l_nBalance, 0 ) != 0 THEN
+                        l_bUpd_End_Date := FALSE;
+                      END IF;
+                      CLOSE c_purge_balance_customer;
+                    END IF;
+                    --
+                    -- Recuperar o Id do cliente p/ as proximas validacoes
+                    IF l_bUpd_End_Date THEN
+                      l_nCust_account_id := NULL;
+                      OPEN  c_customer ( pc_customer_number => l_rRelation.titular_number
+                                       --, pc_company         => l_rRelation.company
+                                       );
+                      FETCH c_customer INTO l_nCust_account_id;
+                      CLOSE c_customer;
+                      --
+                      IF l_nCust_account_id IS NULL THEN
+                        g_bError        := TRUE;
+                        l_bUpd_End_Date := FALSE;
+                        --
+                        l_rTBML.message_code := 'E00031';
+                        l_rTBML.message      := l_rTBML.message_code   || ' - '
+                                             || TKT_FND_BAC_UTIL_PKG.get_message_f( p_message_code => l_rTBML.message_code )
+                                             || ' - CUSTOMER_NUMBER: ' || l_rRelation.titular_number
+                                             || ' - COMPANY: '         || l_rRelation.company;
+                        TKT_FND_BAC_UTIL_PKG.set_msg_l_p( p_rTBML => l_rTBML );
+                        --
+                      END IF;
+                    END IF;
+                    --
+                    -- 4) Verificar se tem faturamento p/ o cliente entre o periodo_ini e periodo_fim
+                    IF l_bUpd_End_Date THEN
+                      --
+                      OPEN c_exists_trx_for_customer( pc_customer_id => l_nCust_account_id
+                                                    , pc_company     => l_rRelation.company
+                                                    , pc_period_ini  => l_vPeriod_ini
+                                                    , pc_period_fim  => l_vPeriod_fim
+                                                    );
+                      FETCH c_exists_trx_for_customer INTO l_nAux;
+                      IF c_exists_trx_for_customer%FOUND THEN
+                        --
+                        l_bUpd_End_Date := FALSE;
+                        --
+                      END IF;
+                      CLOSE c_exists_trx_for_customer;
+                      --
+                    END IF;
+                    --
+                    -- 5) Verificar se tem evento financeiro p/ o cliente entre o periodo_ini e periodo_fim
+                    IF l_bUpd_End_Date THEN
+                      --
+                      OPEN c_exists_event_for_customer( pc_customer_id => l_nCust_account_id
+                                                      , pc_company     => l_rRelation.company
+                                                      , pc_period_ini  => l_vPeriod_ini
+                                                      , pc_period_fim  => l_vPeriod_fim
+                                                      );
+                      FETCH c_exists_event_for_customer INTO l_nAux;
+                      IF c_exists_event_for_customer%FOUND THEN
+                        --
+                        l_bUpd_End_Date := FALSE;
+                        --
+                      END IF;
+                      CLOSE c_exists_event_for_customer;
+                      --
+                    END IF;
+                    --
+                  END IF; -- IF l_vData_Rel_Fim
+                  --
+                  IF l_bUpd_End_Date THEN
+                    Finalize_Relation_CCS_p( p_rTBRCA => l_rTBRCA
+                                           , p_rTBML  => l_rTBML
+                                           );
+                    l_rTBPA.source_qtd_recorded := l_rTBPA.source_qtd_recorded + 1;
+                    --
+                    -- Tratar o relaciomento dos Representantes:
+                    --
+                    -- 1) Verificar se o Cliente tem algum relacionamento valido (aberto):
+                    l_nAux := NULL;
+                    OPEN  c_TitularCLIENTE_CCS_Open( pc_titular_number => l_rRelation.titular_number
+                                                   , pc_titular_type   => l_rRelation.titular_type
+                                                   , pc_company        => l_rRelation.company
+                                                   );
+                    FETCH c_TitularCLIENTE_CCS_Open INTO l_nAux;
+                    CLOSE c_TitularCLIENTE_CCS_Open;
+                    --
+                    IF l_nAux IS NULL THEN
+                      --
+                      -- 2) Se não tem nenhum relacionamento valido... Finalizar os relacionamentos validos (abertos) dos representantes.
+                      FOR r_RepCCS_Open IN c_RepCCS_Open ( pc_titular_number => l_rRelation.titular_number
+                                                         , pc_titular_type   => l_rRelation.titular_type
+                                                         , pc_company        => l_rRelation.company
+                                                         ) LOOP
+                        --
+                        l_rTBRCA.relation_ccs_id := r_RepCCS_Open.relation_ccs_id;
+                        Finalize_Relation_CCS_p( p_rTBRCA => l_rTBRCA
+                                               , p_rTBML  => l_rTBML
+                                               );
+                      END LOOP;
+                    END IF;
+                    --
+                  END IF;
+                  --
+                END IF; -- IF l_vCCS = 'Y' THEN
+                --
+              END LOOP;
+              CLOSE c_accounts_customer;
+              --
+            END IF;
+            --
+          END IF; -- IF l_rRelation.relation_type
+          --
+        END LOOP;
+        --
+        CLOSE c_relation;
+        --
+      END LOOP; -- FOR l_rCompany IN c_company LOOP
+      --
+    END IF; --IF l_bNextStep THEN
+    --
+    IF l_bNextStep THEN
+      IF l_rTBPA.source_qtd_rejected > 0 THEN
+        --
+        l_rTBML.message_code := 'W00007';
+        l_rTBML.message      := l_rTBML.message_code  || ' - '
+                             || TKT_FND_BAC_UTIL_PKG.get_message_f( p_message_code => l_rTBML.message_code )
+                             || ' - QTD REJEICOES: '  || TO_CHAR(l_rTBPA.source_qtd_rejected);
+        --
+        TKT_FND_BAC_UTIL_PKG.set_msg_l_p( p_rTBML => l_rTBML );
+        --
+        l_rTBPA.complement_bacen_status := 'SUCESSO/ATENCAO';
+      END IF;
+      --
+      IF p_company IS NOT NULL AND l_rTBRCA.relation_ccs_id IS NULL THEN
+        --
+        l_rTBML.message_code := 'E00065';
+        l_rTBML.message      := l_rTBML.message_code  || ' - '
+                             || TKT_FND_BAC_UTIL_PKG.get_message_f( p_message_code => l_rTBML.message_code )
+                             || ' - P_COMPANY '  || p_company;
+        --
+        TKT_FND_BAC_UTIL_PKG.set_msg_l_p( p_rTBML => l_rTBML );
+        --
+        l_rTBPA.bacen_status := 'ERRO';
+        g_bError             := TRUE;
+      END IF;
+
+    ELSE
+      l_rTBPA.bacen_status := 'ERRO';
+    END IF;
+    --
+    IF g_bError THEN
+      l_rTBPA.complement_bacen_status := 'ERRO';
+    END IF;
+    --
+    TKT_FND_BAC_UTIL_PKG.finalize_p
+      ( p_process_name    => p_process_name
+      , p_process_source  => p_process_source
+      , p_rTBPA           => l_rTBPA
+      , p_rTBMH           => l_rTBMH
+      , p_rTBML           => l_rTBML
+      );
+    --
+    COMMIT;
+    --
+    dbms_output.put_line( '' );
+    dbms_output.put_line( '-------------------------------------------' );
+    dbms_output.put_line( 'Totais' );
+    dbms_output.put_line( '-------------------------------------------' );
+    dbms_output.put_line( 'Lidos      : ' || l_rTBPA.source_qtd_read );
+    dbms_output.put_line( 'Atualizados: ' || l_rTBPA.source_qtd_recorded );
+    dbms_output.put_line( '');
+    dbms_output.put_line( 'Terminado  : ' || l_rTBPA.complement_bacen_status);
+    dbms_output.put_line( 'FIM        : ' || TO_CHAR( SYSDATE, 'dd/mm/yyyy hh24:mi:ss' ) );
+    --
+  EXCEPTION
+    WHEN OTHERS THEN
+      l_rTBML.message_code   := 'E00022';
+      l_rTBML.message        := l_rTBML.message_code   || ' - '
+                             || TKT_FND_BAC_UTIL_PKG.get_message_f( p_message_code => l_rTBML.message_code )
+                             || ' - ERRO: '            || SQLERRM;
+      --
+      TKT_FND_BAC_UTIL_PKG.set_msg_l_p( p_rTBML => l_rTBML );
+      --
+      l_rTBPA.bacen_status            := 'ERRO';
+      l_rTBPA.complement_bacen_status := 'OTHERS';
+      TKT_FND_BAC_UTIL_PKG.finalize_p
+        ( p_process_name    => p_process_name
+        , p_process_source  => p_process_source
+        , p_rTBPA           => l_rTBPA
+        , p_rTBMH           => l_rTBMH
+        , p_rTBML           => l_rTBML
+        );
+      --
+      COMMIT;
+  END close_relation_ccs_p;
